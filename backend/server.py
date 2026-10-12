@@ -30,6 +30,16 @@ PROPOSAL_KEEP = 8
 PROPOSAL_STOP = 4
 
 
+def next_words(edges, future, position):
+    # One step of the phrase search: the lattice words at a letter position that can still finish the key, and each
+    # distinct text's best unigram score, the options and priors the model ranks.
+    words = [(end, unigram, word) for end, unigram, word in edges.get(position, ()) if end in future]
+    priors = {}
+    for _, unigram, word in words:
+        priors[word.text] = max(unigram, priors.get(word.text, unigram))
+    return words, priors
+
+
 class Engine:
     def __init__(self):
         root = Path(__file__).resolve().parent.parent
@@ -80,11 +90,11 @@ class Engine:
         words = list(unique.values())
         head = words[:window]
         try:
-            with self.model_lock:
-                probs = self.model.rank(context, [w.text for w in head])
             total = sum(word.freq for word in head)
-            scores = [math.log(max(prob, 1e-12)) + self.model.alpha * math.log(word.freq / total)
-                      for word, prob in zip(head, probs)]
+            priors = [math.log(word.freq / total) for word in head]
+            probs, = self._ask("word", [(context, [w.text for w in head], priors)])
+            alpha = self._alpha("word")
+            scores = [math.log(max(prob, 1e-12)) + alpha * prior for prob, prior in zip(probs, priors)]
             order = sorted(range(len(head)), key=lambda i: scores[i], reverse=True)
             return [head[i] for i in order] + words[window:]
         except Exception as error:
@@ -93,12 +103,18 @@ class Engine:
             logging.warning("model inference failed, using dictionary: %s", error)
             return words
 
-    def _rank_many(self, requests):
-        # Models without rank_many (the test stand-in) answer one request at a time.
+    def _ask(self, kind, requests):
+        # Every model call: (context, texts, priors) per request -> probabilities. kind is "word", "phrase" or "step";
+        # the training data generator overrides this to record what the model is shown. Models without rank_many
+        # (the test stand-in) answer one request at a time.
         with self.model_lock:
-            if hasattr(self.model, "rank_many"):
-                return self.model.rank_many(requests)
-            return [self.model.rank(context, options) for context, options in requests]
+            if len(requests) > 1 and hasattr(self.model, "rank_many"):
+                return self.model.rank_many([(context, texts) for context, texts, _ in requests])
+            return [self.model.rank(context, texts) for context, texts, _ in requests]
+
+    def _alpha(self, kind):
+        # A checkpoint may weigh the prior per kind of call; alpha otherwise.
+        return getattr(self.model, "alphas", {}).get(kind, self.model.alpha)
 
     def _propose(self, context, key, breaks):
         # Phrases the unigram lattice cannot reach because a frequent word crowds out the one the context wants
@@ -109,7 +125,7 @@ class Engine:
         edges, future, depth = self.dictionary.lattice(key, breaks)
         if depth.get(0, PROPOSAL_ROUNDS + 1) > PROPOSAL_ROUNDS:
             return {}
-        alpha = self.model.alpha
+        alpha = self._alpha("step")
         # Open hypotheses by (position, text): (bound, score, prior). Finished phrases by text: (score, prior).
         open_ = {(0, ""): (alpha * future[0], 0.0, 0.0)}
         finished = {}
@@ -119,12 +135,11 @@ class Engine:
                               < sorted(finished.values(), reverse=True)[PROPOSAL_STOP - 1][0]):
                 break
             batch = [(position, text, open_.pop((position, text))) for position, text in ranked[:PROPOSAL_BEAM]]
-            options = [[(end, unigram, word) for end, unigram, word in edges.get(position, ()) if end in future]
-                       for position, _, _ in batch]
-            requests = [(context + text, list(dict.fromkeys(word.text for _, _, word in words)))
-                        for (_, text, _), words in zip(batch, options)]
-            for (_, text, (_, score, prior)), words, (_, texts), probs in zip(
-                    batch, options, requests, self._rank_many(requests)):
+            steps = [next_words(edges, future, position) for position, _, _ in batch]
+            requests = [(context + text, list(priors), list(priors.values()))
+                        for (_, text, _), (_, priors) in zip(batch, steps)]
+            for (_, text, (_, score, prior)), (words, _), (_, texts, _), probs in zip(
+                    batch, steps, requests, self._ask("step", requests)):
                 logp = dict(zip(texts, (math.log(max(p, 1e-12)) for p in probs)))
                 for end, unigram, word in words:
                     phrase, scored = text + word.text, (score + logp[word.text] + alpha * unigram, prior + unigram)
@@ -155,10 +170,9 @@ class Engine:
         texts = sorted(priors, key=priors.get, reverse=True)
         if use_model and self.model is not None:
             try:
-                with self.model_lock:
-                    probs = self.model.rank(context, texts)
-                scores = {text: math.log(max(prob, 1e-12)) + self.model.alpha * priors[text]
-                          for text, prob in zip(texts, probs)}
+                probs, = self._ask("phrase", [(context, texts, [priors[text] for text in texts])])
+                alpha = self._alpha("phrase")
+                scores = {text: math.log(max(prob, 1e-12)) + alpha * priors[text] for text, prob in zip(texts, probs)}
                 texts.sort(key=scores.get, reverse=True)
             except Exception as error:
                 logging.warning("phrase ranking failed: %s", error)

@@ -51,10 +51,14 @@ class Laya:
             raise ValueError("tuned checkpoint does not match base model")
         self.weights.update(tuned)
         mx.eval(self.weights)
-        self.alpha = 0.2
+        self.alpha, self.alphas = 0.2, {}
         blend = finetuned.with_name("blend.json")
         if blend.is_file():
-            self.alpha = float(json.loads(blend.read_text())["alpha"])
+            weights = json.loads(blend.read_text())
+            self.alpha = float(weights["alpha"])
+            # Prior weights learned for phrase and phrase-step options; the engine uses alpha where one is missing.
+            self.alphas = {kind: float(weights[kind + "_alpha"]) for kind in ("phrase", "step")
+                           if kind + "_alpha" in weights}
         self.nheads = self.encoder_cfg["num_attention_heads"]
         self.dim = self.encoder_cfg["hidden_size"] // self.nheads
         self.eps = self.encoder_cfg.get("norm_eps", 1e-5)
