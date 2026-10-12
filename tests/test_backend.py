@@ -62,6 +62,8 @@ class NormalizeTest(unittest.TestCase):
     def test_u_umlaut_spellings(self):
         for raw in ("lv", "lü", "lu:"):
             self.assertEqual(normalize(raw)[0], "lv", raw)
+        for raw, key in [("lue", "lve"), ("nue", "nve"), ("lu'e", "lue"), ("jv", "ju"), ("xve", "xue")]:
+            self.assertEqual(normalize(raw)[0], key, raw)
 
     def test_rejects_other_characters(self):
         with self.assertRaises(ValueError):
@@ -109,9 +111,9 @@ class RankingTest(EngineTest):
         self.engine.model = Ranker("视力", alpha=100.0)
         self.assertEqual(self.texts("shili", ranked=True)[0], "实力")
 
-    def test_only_first_page_is_ranked(self):
+    def test_only_window_is_ranked(self):
         unranked = self.texts("shi", limit=45)
-        self.engine.model = Ranker(unranked[10])
+        self.engine.model = Ranker(unranked[server.EXACT_WINDOW])
         self.assertEqual(self.texts("shi", ranked=True, limit=45), unranked)
 
     def test_learned_words_stay_first(self):
@@ -124,6 +126,43 @@ class RankingTest(EngineTest):
         with self.assertLogs(level="WARNING"):
             self.assertEqual(self.texts("shili", ranked=True), self.texts("shili"))
         self.assertEqual(self.engine.model_error, "broken")
+
+
+class PhraseTest(EngineTest):
+    def test_mixed_key_gets_a_whole_key_phrase(self):
+        # zui and initials, as typed for 最好的味道.
+        first = self.engine.candidates("zuihdwd", "", 12, False, False)[0]
+        self.assertEqual((len(first["text"]), first["consumed"]), (5, 7))
+
+    def test_ranker_chooses_the_phrase(self):
+        self.engine.model = Ranker("最后单位的")
+        self.assertEqual(self.texts("zuihdwd", "我们相信", ranked=True)[0], "最后单位的")
+
+    def test_ranked_with_the_best_whole_key_word(self):
+        self.engine.model = Ranker("我的")
+        self.assertEqual(self.texts("wd", "这本书是", ranked=True)[:2], ["我的", "稳定"])
+        self.engine.model = Ranker("稳定")
+        self.assertEqual(self.texts("wd", "这本书是", ranked=True)[0], "稳定")
+
+    def test_abbreviation_either_side_of_a_digraph(self):
+        # sh is one initial in 什么 (shm), two in 社会主义 (shzy).
+        self.assertEqual([self.texts(key)[0] for key in ("shm", "shzy")], ["什么", "社会主义"])
+
+    def test_apostrophe_ends_a_spelling(self):
+        self.assertIn(["xia", "n"], self.engine.dictionary.tokenizations(*normalize("xia'n")[::2]))
+
+    def test_vowels_and_unfinished_syllables(self):
+        self.assertEqual(self.texts("woaq")[0], "我安全")
+        self.assertIn("我们哈", self.texts("wmha"))  # ha as typed, not only what it may become
+        self.engine.model = Ranker("今天天气很好")
+        self.assertEqual(self.texts("jintiantianqihenha", ranked=True)[0], "今天天气很好")
+
+    def test_ranker_failure_keeps_phrase_and_model(self):
+        # zuihdwd has no whole-key word to rank, so only the phrase stage calls the model.
+        self.engine.model = mock.Mock(alpha=0.0, rank=mock.Mock(side_effect=RuntimeError("broken")))
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(self.texts("zuihdwd", ranked=True), self.texts("zuihdwd"))
+        self.assertIsNotNone(self.engine.model)
 
 
 class PromptTest(unittest.TestCase):

@@ -10,7 +10,24 @@ import sys
 import threading
 from pathlib import Path
 
-from dictionary import Dictionary, Personal, normalize
+from dictionary import INITIAL_COST, Dictionary, Personal, normalize
+
+# Candidates the model re-ranks, by list. Wider windows put more of the right words on page 1 once the model is
+# trained on that many options; the rest keep dictionary order. abbreviated() returns at most 45, so all of it is
+# ranked. Completions were not evaluated beyond 9.
+EXACT_WINDOW = 32
+ABBREVIATED_WINDOW = 45
+COMPLETION_WINDOW = 9
+# Phrases composed for mixed input that the model ranks as whole options in one call, and how many may go before the
+# best whole-key word (and after it, when that word is abbreviated or completed).
+PHRASE_WINDOW = 16
+PHRASE_SHOWN = 3
+# The model-guided phrase search: hypotheses expanded per round (one batched model call), rounds (so words per
+# phrase), proposals added to the phrase pool, and the finished count past which no better-bounded round is run.
+PROPOSAL_BEAM = 3
+PROPOSAL_ROUNDS = 3
+PROPOSAL_KEEP = 8
+PROPOSAL_STOP = 4
 
 
 class Engine:
@@ -52,11 +69,16 @@ class Engine:
             return "ranking model loaded"
         return "dictionary fallback: " + (self.model_error or "model unavailable")
 
-    def _rank(self, context, words):
+    def _rank(self, context, words, window):
         # The model only needs rank(context, options) -> probabilities and a prior weight, alpha.
         if self.model is None or len(words) < 2:
             return words
-        head = words[:9]
+        # Heteronyms can list a text more than once; rank each text once, as in training, keeping its first entry.
+        unique = {}
+        for word in words:
+            unique.setdefault(word.text, word)
+        words = list(unique.values())
+        head = words[:window]
         try:
             with self.model_lock:
                 probs = self.model.rank(context, [w.text for w in head])
@@ -64,12 +86,83 @@ class Engine:
             scores = [math.log(max(prob, 1e-12)) + self.model.alpha * math.log(word.freq / total)
                       for word, prob in zip(head, probs)]
             order = sorted(range(len(head)), key=lambda i: scores[i], reverse=True)
-            return [head[i] for i in order] + words[9:]
+            return [head[i] for i in order] + words[window:]
         except Exception as error:
             self.model_error = str(error)
             self.model = None
             logging.warning("model inference failed, using dictionary: %s", error)
             return words
+
+    def _rank_many(self, requests):
+        # Models without rank_many (the test stand-in) answer one request at a time.
+        with self.model_lock:
+            if hasattr(self.model, "rank_many"):
+                return self.model.rank_many(requests)
+            return [self.model.rank(context, options) for context, options in requests]
+
+    def _propose(self, context, key, breaks):
+        # Phrases the unigram lattice cannot reach because a frequent word crowds out the one the context wants
+        # (zuihdwd after 我们相信: every 最后... outranks 最好的味道). A beam search over the lattice, left to right,
+        # where the model ranks the words that can follow each hypothesis in its context. Hypotheses are ordered by
+        # their score plus alpha times the best unigram completion, a bound on any phrase they can become; once
+        # PROPOSAL_STOP finished phrases beat the best bound, the search stops (no further round could reach that top).
+        edges, future, depth = self.dictionary.lattice(key, breaks)
+        if depth.get(0, PROPOSAL_ROUNDS + 1) > PROPOSAL_ROUNDS:
+            return {}
+        alpha = self.model.alpha
+        # Open hypotheses by (position, text): (bound, score, prior). Finished phrases by text: (score, prior).
+        open_ = {(0, ""): (alpha * future[0], 0.0, 0.0)}
+        finished = {}
+        for _ in range(PROPOSAL_ROUNDS):
+            ranked = sorted(open_, key=open_.get, reverse=True)
+            if not ranked or (len(finished) >= PROPOSAL_STOP and open_[ranked[0]][0]
+                              < sorted(finished.values(), reverse=True)[PROPOSAL_STOP - 1][0]):
+                break
+            batch = [(position, text, open_.pop((position, text))) for position, text in ranked[:PROPOSAL_BEAM]]
+            options = [[(end, unigram, word) for end, unigram, word in edges.get(position, ()) if end in future]
+                       for position, _, _ in batch]
+            requests = [(context + text, list(dict.fromkeys(word.text for _, _, word in words)))
+                        for (_, text, _), words in zip(batch, options)]
+            for (_, text, (_, score, prior)), words, (_, texts), probs in zip(
+                    batch, options, requests, self._rank_many(requests)):
+                logp = dict(zip(texts, (math.log(max(p, 1e-12)) for p in probs)))
+                for end, unigram, word in words:
+                    phrase, scored = text + word.text, (score + logp[word.text] + alpha * unigram, prior + unigram)
+                    if end == len(key):
+                        if phrase not in finished or finished[phrase] < scored:
+                            finished[phrase] = scored
+                    elif (end, phrase) not in open_ or open_[end, phrase][1] < scored[0]:
+                        open_[end, phrase] = (scored[0] + alpha * future[end],) + scored
+        best = sorted(finished.items(), key=lambda item: item[1], reverse=True)[:PROPOSAL_KEEP]
+        return {text: prior for text, (_, prior) in best}
+
+    def _phrases(self, context, key, breaks, use_model, top):
+        # Whole-key phrases for input mixing full syllables and initials (zuihdwd), best first, ranked together with
+        # the best whole-key word (top: text and log prior) if there is one. The model ranks them as whole options, as
+        # it does abbreviated words; if it fails, the prior order stands.
+        paths = self.dictionary.phrases(key, breaks, PHRASE_WINDOW)
+        if not paths:
+            return []
+        priors = {"".join(step[-1].text for step in steps): score for score, steps in paths}
+        if top is not None:
+            priors.setdefault(*top)
+        if use_model and self.model is not None:
+            try:
+                for text, prior in self._propose(context, key, breaks).items():
+                    priors.setdefault(text, prior)
+            except Exception as error:
+                logging.warning("phrase proposals failed: %s", error)
+        texts = sorted(priors, key=priors.get, reverse=True)
+        if use_model and self.model is not None:
+            try:
+                with self.model_lock:
+                    probs = self.model.rank(context, texts)
+                scores = {text: math.log(max(prob, 1e-12)) + self.model.alpha * priors[text]
+                          for text, prob in zip(texts, probs)}
+                texts.sort(key=scores.get, reverse=True)
+            except Exception as error:
+                logging.warning("phrase ranking failed: %s", error)
+        return texts
 
     def candidates(self, raw, context, limit, use_model=True, use_learning=True):
         key, offsets, breaks = normalize(raw)
@@ -87,13 +180,14 @@ class Engine:
         if use_learning and not breaks:
             for text, _ in self.personal.lookup(key):
                 add(text, len(key))
+        learned = len(result)
         exact = [word for word in self.dictionary.exact(key) if word.accepts(breaks)]
         abbreviated = list(self.dictionary.abbreviated(key)) if not breaks else []
         initial = len(key) == 1 and key not in "aoe"
         if use_model:
-            exact = self._rank(context, exact)
+            exact = self._rank(context, exact, EXACT_WINDOW)
             if not exact or initial:
-                abbreviated = self._rank(context, abbreviated)
+                abbreviated = self._rank(context, abbreviated, ABBREVIATED_WINDOW)
         # A lone consonant is normally an initial, not a rare syllabic n/m reading.
         if initial:
             for word in abbreviated:
@@ -106,9 +200,10 @@ class Engine:
             add(word.text, len(key))
         completed = [word for word in self.dictionary.complete(key) if word.accepts(breaks)]
         if use_model and not exact and not abbreviated:
-            completed = self._rank(context, completed)
+            completed = self._rank(context, completed, COMPLETION_WINDOW)
         for word in completed:
             add(word.text, len(key))
+        whole = len(result)
 
         sentences = self.dictionary.sentences(key, breaks)
         if sentences and len(sentences[0][1]) > 1 and use_model and self.model is not None:
@@ -118,7 +213,7 @@ class Engine:
                 if index < 3:
                     inside = {p - start for p in breaks if start < p < end}
                     alternatives = [w for w in self.dictionary.exact(key[start:end]) if w.accepts(inside)]
-                    alternatives = self._rank(preceding, alternatives)
+                    alternatives = self._rank(preceding, alternatives, EXACT_WINDOW)
                     if alternatives:
                         word = alternatives[0]
                 text.append(word.text)
@@ -126,6 +221,21 @@ class Engine:
             add("".join(text), len(key))
         for _, path in sentences:
             add("".join(item[2].text for item in path), len(key))
+        top, follow = None, 0
+        word = next((word for word in exact + abbreviated + completed
+                     if whole > learned and word.text == result[learned]["text"]), None)
+        if word is not None:
+            # Priced as the lattice prices a word: each syllable typed as an initial costs INITIAL_COST. The dictionary
+            # abbreviates every syllable by its first letter (社会主义 is shzy); a completion abbreviates its last.
+            initials = 0 if word in exact else 1 if word in completed else word.syllables.count("'") + 1
+            top = (word.text, math.log(word.freq / self.dictionary.total) - INITIAL_COST * initials)
+            follow = 0 if word in exact else PHRASE_SHOWN
+        elif sentences and len(result) > whole:
+            # Full pinyin reaches the phrase stage when its last syllable may be incomplete (jintiantianqihenha);
+            # the sentence then competes in the same ranking rather than trailing every phrase. Its prior is the
+            # unigram path's, close to that of the model's word choices above.
+            top = (result[whole]["text"], sentences[0][0])
+        phrases = self._phrases(context, key, breaks, use_model, top)
 
         # Prefix candidates let the client commit a phrase and retain the unconsumed input.
         prefix_groups = {}
@@ -138,6 +248,24 @@ class Engine:
                     add(text, end)
             for word in words:
                 add(word.text, end)
+        # Phrases ranked above the best whole-key word go before it (shm: 什么 before 三河马), at most a few so that
+        # the dictionary's list stays on page 1, and a few follow an abbreviated or completed word. Full pinyin keeps
+        # its own words next: 实力 after 视力, not a completion of shili. A listed phrase moves up; learned words stay
+        # first.
+        learned_texts = {candidate["text"] for candidate in result[:learned]}
+        phrases = [text for text in phrases if text not in learned_texts]
+        if top is not None and phrases:
+            at = phrases.index(top[0])
+            rest = phrases[PHRASE_SHOWN:at] + phrases[at + 1:]
+            phrases = phrases[:min(at, PHRASE_SHOWN)] + [top[0]] + rest[:follow]
+        position = learned
+        for text in phrases:
+            index = next((i for i, candidate in enumerate(result) if candidate["text"] == text), len(result))
+            if index >= position:
+                del result[index:index + 1]
+                result.insert(position, {"text": text, "consumed": offsets[len(key) - 1]})
+                position += 1
+        del result[limit:]
         return result
 
     def handle(self, request):

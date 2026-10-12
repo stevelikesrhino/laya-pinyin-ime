@@ -2,6 +2,7 @@
 
 import functools
 import importlib.metadata
+import itertools
 import logging
 import math
 import os
@@ -13,6 +14,22 @@ from pathlib import Path
 
 CHINESE = re.compile(r"^[\u3400-\u9fff]+$")
 CACHE_VERSION = "4"
+# Keep in step with PinyinDictionary.swift.
+INITIALS = frozenset(("b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x",
+                      "zh", "ch", "sh", "r", "z", "c", "s", "y", "w"))
+# Zero-initial syllables typed as their vowel: a for 安 in woaq, e for 而 in eq. Like an initial, a vowel does not
+# split a spelling: ha+o is hao, and wmaq is w+ma+q (wm'aq is w+m+a+q).
+VOWELS = frozenset("aeo")
+# Mixed phrases: syllables per word, words per spelling (for the unigram lattice, and for the model-guided search,
+# which can afford more), letters per key, and the log-prior cost of each syllable typed as an initial or vowel.
+PHRASE_SPAN = 4
+PHRASE_WORDS = 9
+PROPOSAL_WORDS = 16
+PHRASE_LETTERS = 32
+INITIAL_COST = 1.0
+# The last syllable may still be incomplete (ha for 好, qio for 穷): the log-prior cost of reading it so, after
+# Rime's kCompletionPenalty.
+COMPLETION_COST = 3.0
 
 
 def normalize(raw):
@@ -37,6 +54,14 @@ def normalize(raw):
             raise ValueError("pinyin must contain Latin letters or syllable separators")
         i += 1
     boundaries.discard(len(letters))
+    # ü has no key: lue and nue spell lüe (略), and jv, qv, xv, yv spell ju, qu, xu, yu. Not across an apostrophe.
+    for i in range(1, len(letters)):
+        if i in boundaries:
+            continue
+        if letters[i] == "v" and letters[i - 1] in "jqxy":
+            letters[i] = "u"
+        elif letters[i] == "u" and letters[i - 1] in "nl" and letters[i + 1:i + 2] == ["e"] and i + 1 not in boundaries:
+            letters[i] = "v"
     return "".join(letters), ends, boundaries
 
 
@@ -158,6 +183,146 @@ class Dictionary:
         )
         return tuple(Word(*row) for row in rows)
 
+    @functools.lru_cache(maxsize=8192)
+    def spelled(self, abbr, pattern, limit=PHRASE_WORDS):
+        # Words whose syllables match a typed spelling: full syllables literal, initials as zh*, d* ...
+        rows = self.db.execute(
+            "SELECT text,freq,syllables FROM words WHERE abbr=? AND syllables GLOB ? ORDER BY freq DESC LIMIT ?",
+            (abbr, pattern, limit),
+        )
+        return tuple(Word(*row) for row in rows)
+
+    @functools.cached_property
+    def syllables(self):
+        return frozenset(row[0] for row in self.db.execute(
+            "SELECT DISTINCT syllables FROM words WHERE instr(syllables, '''') = 0"))
+
+    @functools.cached_property
+    def syllable_prefixes(self):
+        # Interjections without a vowel (hm, ng) do not absorb initials: nhm is n+h+m.
+        return frozenset(syllable[:end] for syllable in self.syllables if any(v in syllable for v in "aeiouv")
+                         for end in range(1, len(syllable) + 1))
+
+    @functools.cached_property
+    def partial(self):
+        # Proper prefixes of syllables (ha of hao, qio of qiong): what the last token may still become.
+        return frozenset(syllable[:end] for syllable in self.syllables if any(v in syllable for v in "aeiouv")
+                         for end in range(1, len(syllable)))
+
+    def extends(self, token, final):
+        # Whether a token may stand for more than its letters: an initial, a vowel, or the last token while its
+        # syllable may still be being typed (ha for hao).
+        return token in INITIALS or token in VOWELS or (final and token in self.partial)
+
+    def mixed(self, tokens):
+        # Whether a tokenization belongs to the phrase stage: some token is extended. One token is a plain lookup,
+        # and full pinyin is sentences().
+        return len(tokens) > 1 and any(self.extends(token, k == len(tokens) - 1) for k, token in enumerate(tokens))
+
+    def words(self, span, final, limit=PHRASE_WORDS):
+        # Words spelling a run of tokens, each with the cost of the tokens it extends: 0 where the syllable is the
+        # token (哈 for ha), INITIAL_COST for an initial and for any vowel (啊 or 安 for a, so that ay is 奥运 rather
+        # than 啊哟), COMPLETION_COST for a completed last syllable.
+        last, abbr = len(span) - 1, "".join(token[0] for token in span)
+        tokens = [token + "*" if self.extends(token, final and k == last) else token for k, token in enumerate(span)]
+        found = self.spelled(abbr, "'".join(tokens), limit)
+        if tokens[-1] != span[-1] and span[-1] in self.syllables and span[-1] not in INITIALS:
+            # The syllable as typed (哈 for ha) must not be crowded out of the limit by what it may become (好 还 号).
+            found = tuple(dict.fromkeys(self.spelled(abbr, "'".join(tokens[:-1] + [span[-1]]), limit) + found))
+        for word in found:
+            cost = 0.0
+            for token, syllable in zip(span, word.syllables.split("'")):
+                if token in VOWELS:
+                    cost += INITIAL_COST
+                elif syllable != token:
+                    cost += INITIAL_COST if token in INITIALS else COMPLETION_COST
+            yield word, cost
+
+    def tokenizations(self, key, breaks):
+        # Splits into syllables, bare initials and vowels, at most 8 ways; the last token may be the start of a
+        # syllable (qio). An initial or vowel must not be the start of a longer spelling: s+h is sh, xia+n is xian,
+        # zh+ang is zhang, ha+o is hao.
+        memo = {}
+
+        def split(start, previous):
+            if start == len(key):
+                return [[]]
+            if (start, previous) not in memo:
+                result = []
+                # Longest token first, up to the next apostrophe: ha|o or xi|a|ng would fill the cap on long keys.
+                stop = min([len(key), start + 6] + [b for b in breaks if b > start])
+                for end in range(stop, start, -1):
+                    token, following = key[start:end], key[end:end + 1]
+                    if token in INITIALS or token in VOWELS:
+                        # An apostrophe ends the spelling: xia'n is xia+n.
+                        fits = (not previous or start in breaks or previous + token not in self.syllable_prefixes) \
+                            and (not following or end in breaks or token + following not in self.syllable_prefixes)
+                    else:
+                        fits = token in self.syllables or (end == len(key) and token in self.partial)
+                    if fits:
+                        result.extend([token] + rest for rest in split(end, token)[:8 - len(result)])
+                memo[start, previous] = result
+            return memo[start, previous]
+
+        return split(0, "")
+
+    def phrases(self, key, breaks, width=6):
+        # Whole-key phrases from full syllables and initials (zuihdwd -> 最好的味道): a unigram lattice over each
+        # way of splitting the key, scored by unigram frequency less the costs of words(). Steps are (start, end,
+        # word), as in sentences().
+        if len(key) > PHRASE_LETTERS:
+            return []
+        paths = []
+        for tokens in self.tokenizations(key, breaks):
+            if not self.mixed(tokens):
+                continue
+            ends = list(itertools.accumulate(map(len, tokens)))
+            starts = [0] + ends[:-1]
+            beams = {len(tokens): [(0.0, [])]}
+            for i in range(len(tokens) - 1, -1, -1):
+                choices = []
+                for j in range(i + 1, min(len(tokens), i + PHRASE_SPAN) + 1):
+                    if j not in beams:
+                        continue
+                    for word, cost in self.words(tokens[i:j], j == len(tokens)):
+                        score = math.log(word.freq / self.total) - cost
+                        choices.extend((score + rest_score, [(starts[i], ends[j - 1], word)] + rest)
+                                       for rest_score, rest in beams[j])
+                if choices:
+                    beams[i] = _distinct(choices, width)
+            paths.extend(beams.get(0, []))
+        return _distinct(paths, width)
+
+    def lattice(self, key, breaks, limit=PROPOSAL_WORDS):
+        # The phrase lattice over letter positions, merged across tokenizations: edges[start] lists (end, score,
+        # word) with the unigram score of phrases(); future[position] is the best score to the end from there and
+        # depth[position] the fewest words. Empty when the key has no mixed tokenization.
+        edges = {}
+        if len(key) > PHRASE_LETTERS:
+            return edges, {}, {}
+        for tokens in self.tokenizations(key, breaks):
+            if not self.mixed(tokens):
+                continue
+            ends = list(itertools.accumulate(map(len, tokens)))
+            starts = [0] + ends[:-1]
+            for i in range(len(tokens)):
+                for j in range(i + 1, min(len(tokens), i + PHRASE_SPAN) + 1):
+                    for word, cost in self.words(tokens[i:j], j == len(tokens), limit):
+                        score = math.log(word.freq / self.total) - cost
+                        at = edges.setdefault(starts[i], {})
+                        if (ends[j - 1], word.text) not in at or at[ends[j - 1], word.text][0] < score:
+                            at[ends[j - 1], word.text] = (score, word)
+        edges = {start: [(end, score, word) for (end, _), (score, word) in at.items()]
+                 for start, at in edges.items()}
+        future, depth = {len(key): 0.0}, {len(key): 0}
+        for position in range(len(key) - 1, -1, -1):
+            reached = [(score + future[end], depth[end] + 1) for end, score, _ in edges.get(position, ())
+                       if end in future]
+            if reached:
+                future[position] = max(score for score, _ in reached)
+                depth[position] = min(words for _, words in reached)
+        return edges, future, depth
+
     def matches(self, key, start, breaks):
         for end in range(min(len(key), start + self.max_pinyin), start, -1):
             inside = {p - start for p in breaks if start < p < end}
@@ -176,18 +341,22 @@ class Dictionary:
                 score = math.log(word.freq / self.total)
                 for rest_score, rest in beams[end]:
                     choices.append((score + rest_score, [(start, end, word)] + rest))
-            choices.sort(key=lambda item: item[0], reverse=True)
-            unique, seen = [], set()
-            for choice in choices:
-                text = "".join(item[2].text for item in choice[1])
-                if text not in seen:
-                    unique.append(choice)
-                    seen.add(text)
-                    if len(unique) == width:
-                        break
-            if unique:
-                beams[start] = unique
+            if choices:
+                beams[start] = _distinct(choices, width)
         return beams.get(0, [])
+
+
+def _distinct(paths, width):
+    # The best (score, steps) path for each text.
+    unique, seen = [], set()
+    for path in sorted(paths, key=lambda item: item[0], reverse=True):
+        text = "".join(step[-1].text for step in path[1])
+        if text not in seen:
+            unique.append(path)
+            seen.add(text)
+            if len(unique) == width:
+                break
+    return unique
 
 
 class Personal:

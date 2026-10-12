@@ -108,12 +108,18 @@ class Laya:
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(out, prefix + (".out_proj" if head else ".Wo"))
 
-    def logits(self, ids, markers):
-        x = self.weights["encoder.embeddings.tok_embeddings.weight"][mx.array([ids])]
+    def logits(self, batch, markers):
+        # One forward pass for several sequences, padded to the longest and masked at the keys; results match the
+        # sequences run alone.
+        length = max(map(len, batch))
+        valid = mx.array([[i < len(ids) for i in range(length)] for ids in batch])[:, None, None, :]
+        x = self.weights["encoder.embeddings.tok_embeddings.weight"][mx.array(
+            [ids + [self.sep_id] * (length - len(ids)) for ids in batch])]
         x = self._norm(x, "encoder.embeddings.norm")
-        pos = mx.arange(len(ids))
+        pos = mx.arange(length)
         window = self.encoder_cfg["local_attention"] // 2
-        local_mask = mx.abs(pos[:, None] - pos[None, :]) <= window
+        full_mask = mx.broadcast_to(valid, (len(batch), 1, length, length))
+        local_mask = mx.logical_and(mx.abs(pos[:, None] - pos[None, :]) <= window, valid)
         layer_types = self.encoder_cfg.get("layer_types")
         for i in range(self.encoder_cfg["num_hidden_layers"]):
             prefix = f"encoder.layers.{i}"
@@ -125,33 +131,50 @@ class Laya:
                 "global_rope_theta" if kind == "full_attention" else "local_rope_theta", 160000))
             normalized = x if i == 0 else self._norm(x, prefix + ".attn_norm")
             x = x + self._attention(normalized, prefix + ".attn",
-                                    None if kind == "full_attention" else local_mask, theta)
+                                    full_mask if kind == "full_attention" else local_mask, theta)
             a, gate = mx.split(self._linear(self._norm(x, prefix + ".mlp_norm"), prefix + ".mlp.Wi"), 2, axis=-1)
             x = x + self._linear(nn.gelu(a) * gate, prefix + ".mlp.Wo")
         x = self._norm(x, "encoder.final_norm") + self.weights["type_emb.weight"][0]
         for i in range(self.cfg["head_layers"]):
             prefix = f"head.layers.{i}"
             x = x + self._attention(self._norm(x, prefix + ".norm1", 1e-5),
-                                    prefix + ".self_attn", head=True)
+                                    prefix + ".self_attn", full_mask, head=True)
             a = self._linear(self._norm(x, prefix + ".norm2", 1e-5), prefix + ".linear1")
             x = x + self._linear(mx.maximum(a, 0), prefix + ".linear2")
-        x = self._norm(x[:, mx.array(markers), :], "scorer.0", 1e-5)
-        x = nn.gelu(self._linear(x, "scorer.1"))
-        return self._linear(x, "scorer.3")[0, :, 0].astype(mx.float32)
+        scores = []
+        for row, positions in enumerate(markers):
+            y = self._norm(x[row:row + 1, mx.array(positions), :], "scorer.0", 1e-5)
+            y = nn.gelu(self._linear(y, "scorer.1"))
+            scores.append(self._linear(y, "scorer.3")[0, :, 0].astype(mx.float32))
+        return scores
 
     def rank(self, context, options):
         """Choice probabilities for options after the preceding text; training wrote no context as （无）."""
         return self.choice("上文：" + (context[-32:] or "（无）"), INSTRUCTIONS, options)
 
+    def rank_many(self, requests):
+        """rank() for several (context, options) pairs, in one forward pass."""
+        return self.choices([("上文：" + (context[-32:] or "（无）"), INSTRUCTIONS, options)
+                             for context, options in requests])
+
     def choice(self, state, instructions, options):
-        if len(options) < 2:
-            return [1.0] * len(options)
-        ids, markers = self.encode(state, instructions, options)
-        logits = self.logits(ids, markers)
-        temperature = self.cfg.get("temperature", [1.0])[0]
+        return self.choices([(state, instructions, options)])[0]
+
+    def choices(self, questions):
+        probs = [[1.0] * len(options) if len(options) < 2 else None for _, _, options in questions]
+        asked = [i for i, p in enumerate(probs) if p is None]
+        if not asked:
+            return probs
+        encoded = [self.encode(*questions[i]) for i in asked]
+        logits = self.logits([ids for ids, _ in encoded], [markers for _, markers in encoded])
         buckets = self.cfg.get("temperature_by_options", {})
-        bucket = "2" if len(options) == 2 else "3-5" if len(options) <= 5 else "6-10" if len(options) <= 10 else "11+"
-        temperature = buckets.get("choice:" + bucket, temperature)
-        probs = mx.softmax(logits / temperature)
-        mx.eval(probs)
-        return probs.tolist()
+        results = []
+        for i, scores in zip(asked, logits):
+            n = len(questions[i][2])
+            bucket = "2" if n == 2 else "3-5" if n <= 5 else "6-10" if n <= 10 else "11+"
+            temperature = buckets.get("choice:" + bucket, self.cfg.get("temperature", [1.0])[0])
+            results.append(mx.softmax(scores / temperature))
+        mx.eval(results)
+        for i, result in zip(asked, results):
+            probs[i] = result.tolist()
+        return probs

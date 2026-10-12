@@ -204,9 +204,12 @@ test("common words, sentences and abbreviations come first") {
     }
     check(dictionary.candidates("xian", limit: 1, useLearning: false).first?.text != "西安", "xian is not xi'an")
     check(dictionary.candidates("lv", limit: 9, useLearning: false).contains { $0.text == "绿" }, "v spells ü")
+    check(dictionary.candidates("celue", limit: 9, useLearning: false).first?.text == "策略"
+          && dictionary.candidates("jvzi", limit: 9, useLearning: false).first?.text == "句子", "lue spells lüe, jv spells ju")
     check(dictionary.candidates("nihaoshijie", limit: 45, useLearning: false).contains { $0.text == "你好" && $0.consumed == 5 },
           "prefix candidate consumes its own input")
     equal(dictionary.syllableSpaces("zhongguoren"), [5, 8], "preedit spaces")
+    equal(dictionary.syllableSpaces("nhm"), [1, 2], "an interjection (hm) is not spaced as a syllable")
 }
 
 test("fuzzy pinyin is opt-in") {

@@ -1,8 +1,9 @@
 import Foundation
 import SQLite3
 
-// In-process port of backend Engine.candidates(use_model=False). Lookups take about a
-// millisecond, so they run synchronously on the main thread; Python only re-ranks.
+// In-process port of backend Engine.candidates(use_model=False), without the engine's multi-word
+// phrases and last-syllable completion. Lookups take about a millisecond, so they run synchronously
+// on the main thread; Python re-ranks and adds phrases.
 final class PinyinDictionary {
     private struct Word {
         let text: String
@@ -40,9 +41,13 @@ final class PinyinDictionary {
         }
         return result
     }()
-    private lazy var syllablePrefixes = Set(syllables.flatMap { syllable in
-        (1...syllable.count).map { String(syllable.prefix($0)) }
+    // Interjections without a vowel (hm, ng) do not absorb initials, nor are they spaced as syllables: nhm is n+h+m.
+    private lazy var spellingPrefixes = Set(syllables.filter { $0.contains(where: "aeiouv".contains) }.flatMap {
+        syllable in (1...syllable.count).map { String(syllable.prefix($0)) }
     })
+    // Zero-initial syllables typed as their vowel: a for 安 in woaq, e for 而 in eq. Like an initial, a vowel does
+    // not split a spelling: ha+o is hao, and wmaq is w+ma+q (wm'aq is w+m+a+q).
+    private static let vowels: Set<String> = ["a", "e", "o"]
     private static let initials: Set<String> = ["b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q",
                                                 "x", "zh", "ch", "sh", "r", "z", "c", "s", "y", "w"]
     private let personalPath: URL
@@ -139,9 +144,9 @@ final class PinyinDictionary {
                 if breaks.contains(where: { start < $0 && $0 < end }) { continue }
                 let token = String(decoding: key[start..<end], as: UTF8.self)
                 let cost: Double
-                if syllables.contains(token) { cost = 1 }
+                if syllables.contains(token) && token.contains(where: "aeiouv".contains) { cost = 1 }
                 else if Self.initials.contains(token) { cost = 1.1 }
-                else if end == key.count && syllablePrefixes.contains(token) { cost = 1.05 }
+                else if end == key.count && spellingPrefixes.contains(token) { cost = 1.05 }
                 else if end - start == 1 { cost = 2 }
                 else { continue }
                 if best[start].cost + cost < best[end].cost { best[end] = (best[start].cost + cost, start) }
@@ -158,11 +163,11 @@ final class PinyinDictionary {
     // Mixed full and abbreviated syllables, e.g. zhgr or zgren for 中国人.
     private func mixedWords(_ key: [UInt8], _ breaks: Set<Int>) -> [Word] {
         var result: [Word] = [], seen = Set<String>()
+        let extends = { (token: String) in Self.initials.contains(token) || Self.vowels.contains(token) }
         for tokens in tokenizations(key, breaks)
-        where tokens.count > 1 && tokens.contains(where: Self.initials.contains)
-            && !tokens.allSatisfy({ $0.count == 1 && Self.initials.contains($0) }) {
+        where tokens.count > 1 && tokens.contains(where: extends) && !tokens.allSatisfy({ $0.count == 1 && extends($0) }) {
             let abbr = tokens.map { String($0.prefix(1)) }.joined()
-            let pattern = tokens.map { Self.initials.contains($0) ? $0 + "*" : $0 }.joined(separator: "'")
+            let pattern = tokens.map { extends($0) ? $0 + "*" : $0 }.joined(separator: "'")
             for word in words(mixedQuery, "m" + pattern, abbr, pattern) where seen.insert(word.text).inserted {
                 result.append(word)
             }
@@ -171,8 +176,8 @@ final class PinyinDictionary {
         return Array(result.prefix(45))
     }
 
-    // Splits into syllables and bare initials. An initial must not be the start of a longer
-    // spelling: s+h is sh, xia+n is xian, zh+ang is zhang.
+    // Splits into syllables, bare initials and vowels. An initial or vowel must not be the start of a longer
+    // spelling: s+h is sh, xia+n is xian, zh+ang is zhang, ha+o is hao.
     private func tokenizations(_ key: [UInt8], _ breaks: Set<Int>) -> [[String]] {
         var memo: [String: [[String]]] = [:]
         func from(_ start: Int, after previous: String) -> [[String]] {
@@ -180,15 +185,18 @@ final class PinyinDictionary {
             let memoKey = "\(start)|\(previous)"
             if let done = memo[memoKey] { return done }
             var result: [[String]] = []
-            for end in (start + 1)...min(key.count, start + 6) {
+            // Longest token first, up to the next apostrophe: ha|o or xi|a|ng would fill the cap on long keys.
+            let stop = min(key.count, start + 6, breaks.filter { $0 > start }.min() ?? key.count)
+            for end in stride(from: stop, to: start, by: -1) {
                 let token = String(decoding: key[start..<end], as: UTF8.self)
-                let initial = Self.initials.contains(token)
+                let initial = Self.initials.contains(token) || Self.vowels.contains(token)
                 let next = end < key.count ? String(UnicodeScalar(key[end])) : ""
-                if initial ? (previous.isEmpty || !syllablePrefixes.contains(previous + token)) && (next.isEmpty || !syllablePrefixes.contains(token + next))
+                // An apostrophe ends the spelling: xia'n is xia+n.
+                if initial ? (previous.isEmpty || breaks.contains(start) || !spellingPrefixes.contains(previous + token))
+                                 && (next.isEmpty || breaks.contains(end) || !spellingPrefixes.contains(token + next))
                            : syllables.contains(token) {
                     for rest in from(end, after: token) where result.count < 8 { result.append([token] + rest) }
                 }
-                if breaks.contains(end) { break }
             }
             memo[memoKey] = result
             return result
@@ -222,6 +230,18 @@ final class PinyinDictionary {
             i += 1
         }
         boundaries.remove(letters.count)
+        // ü has no key: lue and nue spell lüe (略), and jv, qv, xv, yv spell ju, qu, xu, yu. Not across an apostrophe.
+        let (j, l, n, q, u, v, x, y, e) = (UInt8(ascii: "j"), UInt8(ascii: "l"), UInt8(ascii: "n"), UInt8(ascii: "q"),
+                                           UInt8(ascii: "u"), UInt8(ascii: "v"), UInt8(ascii: "x"), UInt8(ascii: "y"),
+                                           UInt8(ascii: "e"))
+        for i in letters.indices.dropFirst() where !boundaries.contains(i) {
+            if letters[i] == v && [j, q, x, y].contains(letters[i - 1]) {
+                letters[i] = u
+            } else if letters[i] == u && [n, l].contains(letters[i - 1]) && i + 1 < letters.count
+                        && letters[i + 1] == e && !boundaries.contains(i + 1) {
+                letters[i] = v
+            }
+        }
         return (letters, ends, boundaries)
     }
 
