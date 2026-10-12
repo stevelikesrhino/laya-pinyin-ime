@@ -1,0 +1,5 @@
+mlx==0.32.3
+tokenizers==0.23.3
+jieba==0.42.1
+pypinyin==0.55.0
+huggingface-hub==1.33.0
