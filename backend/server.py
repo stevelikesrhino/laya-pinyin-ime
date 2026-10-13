@@ -52,6 +52,7 @@ class Engine:
         self.personal = Personal(data / "personal.sqlite3")
         self.model = None
         self.model_error = None
+        self.ranked = False
         self.loading = True
         self.model_lock = threading.Lock()
         self.loader = threading.Thread(target=self._load_model, name="laya-model", daemon=True)
@@ -98,8 +99,7 @@ class Engine:
             order = sorted(range(len(head)), key=lambda i: scores[i], reverse=True)
             return [head[i] for i in order] + words[window:]
         except Exception as error:
-            self.model_error = str(error)
-            self.model = None
+            # One failed request keeps its dictionary order; the model stays available, as in the phrase stage.
             logging.warning("model inference failed, using dictionary: %s", error)
             return words
 
@@ -109,8 +109,12 @@ class Engine:
         # (the test stand-in) answer one request at a time.
         with self.model_lock:
             if len(requests) > 1 and hasattr(self.model, "rank_many"):
-                return self.model.rank_many([(context, texts) for context, texts, _ in requests])
-            return [self.model.rank(context, texts) for context, texts, _ in requests]
+                probs = self.model.rank_many([(context, texts) for context, texts, _ in requests])
+            else:
+                probs = [self.model.rank(context, texts) for context, texts, _ in requests]
+        # The client marks re-ranked candidates only when a model call in this request succeeded.
+        self.ranked = True
+        return probs
 
     def _alpha(self, kind):
         # A checkpoint may weigh the prior per kind of call; alpha otherwise.
@@ -303,10 +307,11 @@ class Engine:
             limit = request.get("limit", 45)
             if not isinstance(limit, int) or isinstance(limit, bool):
                 raise ValueError("limit must be an integer")
+            self.ranked = False
             candidates = self.candidates(raw, context, max(1, min(45, limit)),
                                          request.get("use_model", True) is not False,
                                          request.get("use_learning", True) is not False)
-            return {"candidates": candidates, "model_status": self.model_status()}
+            return {"candidates": candidates, "ranked": self.ranked, "model_status": self.model_status()}
         if operation == "learn":
             raw, text = request.get("pinyin", ""), request.get("text", "")
             if not isinstance(raw, str) or not isinstance(text, str):

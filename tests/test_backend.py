@@ -127,7 +127,7 @@ class RankingTest(EngineTest):
         self.engine.model = mock.Mock(alpha=0.0, rank=mock.Mock(side_effect=RuntimeError("broken")))
         with self.assertLogs(level="WARNING"):
             self.assertEqual(self.texts("shili", ranked=True), self.texts("shili"))
-        self.assertEqual(self.engine.model_error, "broken")
+        self.assertIsNotNone(self.engine.model)
 
 
 class PhraseTest(EngineTest):

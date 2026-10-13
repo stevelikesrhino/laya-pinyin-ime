@@ -287,7 +287,7 @@ final class LayaInputController: IMKInputController {
                     merged.insert(candidate, at: ranked && digraph ? merged.count : min(index, merged.count))
                 }
                 // Mark what the model placed ahead of its dictionary position, or composed itself.
-                self.promoted = ranked && !local.isEmpty ? Set(merged.indices.filter {
+                self.promoted = reply?.ranked == true && !local.isEmpty ? Set(merged.indices.filter {
                     reranked.contains(merged[$0].text) && (local.firstIndex(of: merged[$0].text) ?? .max) > $0
                 }.map { merged[$0].text }) : []
                 self.candidates = merged

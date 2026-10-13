@@ -9,6 +9,8 @@ struct LayaCandidate: Decodable {
 struct BackendReply: Decodable {
     let id: Int
     let candidates: [LayaCandidate]?
+    // A model call succeeded for this request, not merely that ranking was asked for.
+    let ranked: Bool?
     let model_status: String?
     let error: String?
 }
