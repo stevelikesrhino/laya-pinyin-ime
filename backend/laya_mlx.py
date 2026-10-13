@@ -26,6 +26,9 @@ def model_paths():
 
 class Laya:
     def __init__(self, base=None, finetuned=None):
+        # Every request has its own shape, so MLX's cache of freed buffers only grows (10 GB in 1,800 requests).
+        # 1 GiB costs about 0.5 ms per request.
+        mx.set_cache_limit(1 << 30)
         if base is None or finetuned is None:
             default_base, default_tuned = model_paths()
             base, finetuned = base or default_base, finetuned or default_tuned
