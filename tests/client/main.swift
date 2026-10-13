@@ -170,7 +170,8 @@ func personalStore(_ url: URL, _ rows: [(pinyin: String, text: String)]) {
     sqlite3_open(url.path, &db)
     sqlite3_exec(db, "CREATE TABLE learned (pinyin TEXT NOT NULL, text TEXT NOT NULL, count INTEGER NOT NULL, "
                      + "updated REAL NOT NULL, PRIMARY KEY(pinyin,text)) WITHOUT ROWID", nil, nil, nil)
-    for row in rows { sqlite3_exec(db, "INSERT INTO learned VALUES ('\(row.pinyin)','\(row.text)',1,0)", nil, nil, nil) }
+    let now = Date().timeIntervalSince1970
+    for row in rows { sqlite3_exec(db, "INSERT INTO learned VALUES ('\(row.pinyin)','\(row.text)',1,\(now))", nil, nil, nil) }
     sqlite3_close(db)
 }
 
@@ -218,7 +219,7 @@ test("fuzzy pinyin is opt-in") {
     equal(dictionary.candidates("zongguo", limit: 1, useLearning: false, fuzzy: true).first?.text, "中国", "z = zh")
 }
 
-test("learned words come first and can be forgotten") {
+test("personal names remain available and can be forgotten") {
     let personal = data.appendingPathComponent("dictionary-test.sqlite3")
     personalStore(personal, [("zhangwei", "张伟")])
     let dictionary = PinyinDictionary(dictionary: dictionaryURL, personal: personal)!

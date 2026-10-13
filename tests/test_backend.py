@@ -116,10 +116,12 @@ class RankingTest(EngineTest):
         self.engine.model = Ranker(unranked[server.EXACT_WINDOW])
         self.assertEqual(self.texts("shi", ranked=True, limit=45), unranked)
 
-    def test_learned_words_stay_first(self):
+    def test_learned_words_compete_with_context(self):
         self.engine.handle({"op": "learn", "pinyin": "shili", "text": "十里"})
         self.engine.model = Ranker("视力")
-        self.assertEqual(self.texts("shili", ranked=True)[:2], ["十里", "视力"])
+        words = self.texts("shili", ranked=True)
+        self.assertEqual(words[0], "视力")
+        self.assertIn("十里", words)
 
     def test_ranker_failure_keeps_dictionary_order(self):
         self.engine.model = mock.Mock(alpha=0.0, rank=mock.Mock(side_effect=RuntimeError("broken")))

@@ -1,0 +1,21 @@
+{"id":"homophone-vision","ctx":"体检发现他的","raw":"shili","gold":"视力"}
+{"id":"homophone-strength","ctx":"这支球队的","raw":"shili","gold":"实力"}
+{"id":"abbr-meeting","ctx":"会议结束后我们","raw":"lx","gold":"联系"}
+{"id":"abbr-practice","ctx":"这个动作需要多加","raw":"lx","gold":"练习"}
+{"id":"mixed-single-word","ctx":"项目已经","raw":"kshi","gold":"开始"}
+{"id":"digraph-single","ctx":"这本书真的","raw":"sh","gold":"是"}
+{"id":"digraph-word","ctx":"他正在做出门的","raw":"zhb","gold":"准备"}
+{"id":"digraph-double-word-sh","ctx":"这个时间比较","raw":"sh","gold":"适合"}
+{"id":"digraph-double-word-zh","ctx":"这个方案目前是","raw":"zh","gold":"最好"}
+{"id":"digraph-account","ctx":"请登录你的","raw":"zh","gold":"账户"}
+{"id":"digraph-trailing-separator","ctx":"你知道他是","raw":"sh'","gold":"谁"}
+{"id":"completion","ctx":"请把文件发给我的","raw":"pengyo","gold":"朋友"}
+{"id":"bilingual-context","ctx":"这个 API 的兼容性","raw":"wti","gold":"问题"}
+{"id":"number-context","ctx":"版本 4.1 今天开始","raw":"cs","gold":"测试"}
+{"id":"mixed-span","ctx":"我现在开会，","raw":"mingtzailx","gold":"明天再联系"}
+{"id":"apostrophe","ctx":"这次出差去","raw":"xi'an","gold":"西安"}
+{"id":"empty-context","ctx":"","raw":"xiexie","gold":"谢谢"}
+{"id":"long-horizontal-page","ctx":"","raw":"jintiantianqihenhaowomenmingtianqupashan","gold":"今天天气很好我们明天去爬山"}
+{"id":"prefix-picks","ctx":"","raw":"nihaoshijie","gold":"你好世界","picks":["你好","世界"]}
+{"id":"name-picks","ctx":"负责人是","raw":"zhangwei","gold":"张伟","picks":["张","伟"]}
+{"id":"typo-repair","ctx":"我正在","raw":"gongzo","gold":"工作","actions":[{"type":"type","text":"gongzo"},{"type":"key","key":"backspace"},{"type":"type","text":"uo"},{"type":"wait","ms":80},{"type":"pick","text":"工作"}]}

@@ -100,21 +100,26 @@ final class PinyinDictionary {
             result.append(LayaCandidate(text: text, consumed: offsets[length - 1]))
         }
         let whole = String(decoding: key, as: UTF8.self)
-        if useLearning && breaks.isEmpty {
-            for text in learned(whole) { add(text, key.count) }
-        }
-        let exact = fuzzy ? fuzzyWords(key, breaks) : words(exactQuery, "e" + whole, whole).filter { $0.accepts(breaks) }
-        let abbreviated = breaks.isEmpty ? words(abbreviatedQuery, "a" + whole, whole) : []
+        let personal = useLearning && breaks.isEmpty ? learned(whole) : []
+        var exact = fuzzy ? fuzzyWords(key, breaks) : words(exactQuery, "e" + whole, whole).filter { $0.accepts(breaks) }
+        var abbreviated = breaks.isEmpty ? abbreviatedWords(whole) : []
+        var completed = words(completeQuery, "c" + whole, whole, whole + "{").filter { $0.accepts(breaks) }
         // A lone consonant is normally an initial, not a rare syllabic n/m reading.
-        if key.count == 1 && !"aoe".utf8.contains(key[0]) {
+        let initial = key.count == 1 && !"aoe".utf8.contains(key[0])
+        var mixed = mixedWords(key, breaks)
+        if !exact.isEmpty && !initial { exact = personalize(exact, personal) }
+        else if !abbreviated.isEmpty { abbreviated = personalize(abbreviated, personal) }
+        else if !completed.isEmpty || mixed.isEmpty { completed = personalize(completed, personal) }
+        // Mixed input (zhwei): learned words compete with the words it spells, as the engine prices them.
+        else { mixed = personalize(mixed, personal) }
+        if initial {
             for word in abbreviated { add(word.text, key.count) }
         }
         for word in exact { add(word.text, key.count) }
         for word in abbreviated { add(word.text, key.count) }
-        for word in mixedWords(key, breaks) { add(word.text, key.count) }
-        for word in words(completeQuery, "c" + whole, whole, whole + "{") where word.accepts(breaks) {
-            add(word.text, key.count)
-        }
+        for word in mixed { add(word.text, key.count) }
+        for word in completed { add(word.text, key.count) }
+        for entry in personal { add(entry.text, key.count) }
         for (_, path) in sentences(key, breaks, fuzzy: fuzzy) {
             add(path.map(\.word.text).joined(), key.count)
         }
@@ -125,11 +130,13 @@ final class PinyinDictionary {
             groups[end, default: []].append(word)
         }
         for end in ends {
-            if useLearning && breaks.isEmpty {
-                for text in learned(String(decoding: key[..<end], as: UTF8.self)) { add(text, end) }
-            }
-            for word in groups[end]! { add(word.text, end) }
+            let personal = useLearning && breaks.isEmpty ? learned(String(decoding: key[..<end], as: UTF8.self)) : []
+            for word in personalize(groups[end]!, personal) { add(word.text, end) }
         }
+        // Keep page one intact, but leave room on later pages for less-used personal spellings.
+        let tail = personal.filter { entry in !result.contains { $0.text == entry.text } }
+            .prefix(max(0, limit - 9)).map { LayaCandidate(text: $0.text, consumed: offsets[key.count - 1]) }
+        if !tail.isEmpty { result = Array(result.prefix(max(9, limit - tail.count))) + tail }
         return result
     }
 
@@ -158,6 +165,38 @@ final class PinyinDictionary {
             position = best[position].cut
         }
         return spaces
+    }
+
+    private func abbreviatedWords(_ key: String) -> [Word] {
+        var result = words(abbreviatedQuery, "a" + key, key)
+        if ["zh", "ch", "sh"].contains(key) {
+            // A lone digraph also reaches one-syllable words, alongside two-syllable abbreviations.
+            result += words(mixedQuery, "i" + key, String(key.prefix(1)), key + "*")
+            result.sort { $0.freq > $1.freq }
+        }
+        return result
+    }
+
+    private func personalize(_ words: [Word], _ learned: [(text: String, weight: Double)]) -> [Word] {
+        guard !learned.isEmpty else { return words }
+        // SQLite keys rows by bytes, Swift strings by canonical equivalence: two stored texts may collide here.
+        let weights = Dictionary(learned.map { ($0.text, $0.weight) }, uniquingKeysWith: max)
+        let maximum = words.map(\.freq).max() ?? 1
+        let texts = Set(words.map(\.text))
+        // A new personal word: each recent pick counts as twice the best word, fading to nothing as it ages.
+        var boosted = learned.prefix(3).filter { !texts.contains($0.text) }.map {
+            Word(text: $0.text, freq: max(1, Int64(2 * Double(maximum) * ($0.weight - 1))), syllables: "")
+        }
+        boosted += words.filter { weights[$0.text] != nil }.map {
+            Word(text: $0.text, freq: max(1, Int64(Double($0.freq) * weights[$0.text]!)), syllables: $0.syllables)
+        }
+        // Unlearned completions keep their shortest-spelling-first order.
+        var result = words.filter { weights[$0.text] == nil }
+        for word in boosted.sorted(by: { $0.freq > $1.freq }) {
+            let index = result.firstIndex { $0.freq < word.freq } ?? result.count
+            result.insert(word, at: index)
+        }
+        return result
     }
 
     // Mixed full and abbreviated syllables, e.g. zhgr or zgren for 中国人.
@@ -382,7 +421,7 @@ final class PinyinDictionary {
     }
 
     // personal.sqlite3 belongs to the Python backend; read it, and only once it exists.
-    private func learned(_ key: String) -> [String] {
+    private func learned(_ key: String) -> [(text: String, weight: Double)] {
         if personalQuery == nil {
             guard FileManager.default.fileExists(atPath: personalPath.path) else { return [] }
             // Read-write without CREATE so a missing file stays missing; query_only forbids writes.
@@ -390,8 +429,8 @@ final class PinyinDictionary {
             if sqlite3_open_v2("file:\(personalPath.path)?mode=rw", &handle,
                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, nil) == SQLITE_OK, let handle,
                sqlite3_exec(handle, "PRAGMA query_only=1", nil, nil, nil) == SQLITE_OK,
-               let query = Self.prepare(handle, "SELECT text FROM learned WHERE pinyin=? "
-                                                + "ORDER BY count DESC,updated DESC LIMIT 45") {
+               let query = Self.prepare(handle, "SELECT text,1.0+MIN(count,7)/(1.0+MAX(0,?-updated)/(30.0*24*60*60)) AS weight "
+                                                + "FROM learned WHERE pinyin=? ORDER BY weight DESC,updated DESC LIMIT 45") {
                 sqlite3_busy_timeout(handle, 50)
                 personal = handle
                 personalQuery = query
@@ -402,11 +441,12 @@ final class PinyinDictionary {
         }
         guard let query = personalQuery else { return [] }
         sqlite3_reset(query)
-        sqlite3_bind_text(query, 1, key, -1, Self.transient)
-        var texts: [String] = []
-        while sqlite3_step(query) == SQLITE_ROW { texts.append(Self.text(query, 0)) }
+        sqlite3_bind_double(query, 1, Date().timeIntervalSince1970)
+        sqlite3_bind_text(query, 2, key, -1, Self.transient)
+        var entries: [(text: String, weight: Double)] = []
+        while sqlite3_step(query) == SQLITE_ROW { entries.append((Self.text(query, 0), sqlite3_column_double(query, 1))) }
         sqlite3_reset(query)
-        return texts
+        return entries
     }
 
     private static func prepare(_ db: OpaquePointer, _ sql: String) -> OpaquePointer? {

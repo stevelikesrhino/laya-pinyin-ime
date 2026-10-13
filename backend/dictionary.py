@@ -81,6 +81,27 @@ class Word:
         return breaks.issubset(offsets)
 
 
+def personalize(words, learned, reference=1):
+    # A decaying, bounded prior, not a pin above the model. A new personal word has no dictionary frequency: each
+    # recent pick counts as twice the list's best word (reference when the list is empty), fading to nothing as it
+    # ages. Only a few enter the ranked window so a long history cannot crowd out the dictionary's alternatives.
+    if not learned:
+        return words
+    weights = dict(learned)
+    maximum = max((word.freq for word in words), default=reference)
+    texts = {word.text for word in words}
+    boosted = [Word(text, max(1, int(2 * maximum * (weight - 1))), "")
+               for text, weight in learned[:3] if text not in texts]
+    boosted += [Word(word.text, max(1, int(word.freq * weights[word.text])), word.syllables)
+                for word in words if word.text in weights]
+    # Unlearned completions keep their shortest-spelling-first order.
+    result = [word for word in words if word.text not in weights]
+    for word in sorted(boosted, key=lambda word: word.freq, reverse=True):
+        at = next((i for i, other in enumerate(result) if other.freq < word.freq), len(result))
+        result.insert(at, word)
+    return result
+
+
 class Dictionary:
     def __init__(self, path):
         self.path = Path(path)
@@ -172,7 +193,12 @@ class Dictionary:
         rows = self.db.execute(
             "SELECT text,freq,syllables FROM words WHERE abbr=? ORDER BY freq DESC LIMIT 45", (key,),
         )
-        return tuple(Word(*row) for row in rows)
+        words = [Word(*row) for row in rows]
+        if key in ("zh", "ch", "sh"):
+            # A lone digraph is also one initial (sh -> 是), not only a two-syllable abbreviation (社会).
+            words.extend(self.spelled(key[0], key + "*", 45))
+            words.sort(key=lambda word: word.freq, reverse=True)
+        return tuple(words)
 
     @functools.lru_cache(maxsize=2048)
     def complete(self, key):
@@ -389,7 +415,8 @@ class Personal:
 
     def lookup(self, key):
         return self.db.execute(
-            "SELECT text,count FROM learned WHERE pinyin=? ORDER BY count DESC,updated DESC LIMIT 45", (key,),
+            "SELECT text,1.0+MIN(count,7)/(1.0+MAX(0,?-updated)/(30.0*24*60*60)) AS weight "
+            "FROM learned WHERE pinyin=? ORDER BY weight DESC,updated DESC LIMIT 45", (time.time(), key),
         ).fetchall()
 
     def count(self):

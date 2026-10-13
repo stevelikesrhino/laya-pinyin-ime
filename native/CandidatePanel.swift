@@ -80,32 +80,40 @@ final class CandidatePanel {
         let titles = candidates.enumerated().map {
             title($1, number: $0 + 1, focused: $0 == selected, inset: !horizontal, marked: marked.contains($0))
         }
+        let bounds = screenBounds(caret)
         let size: NSSize
         if horizontal {
-            // One row like Apple's Pinyin; the pinyin itself is already shown inline.
+            // Wrap long pages instead of hiding candidates off-screen; numbering and paging stay at nine.
             heading.isHidden = true
             footer.isHidden = !candidates.isEmpty
             footer.stringValue = "Laya · \(status)"
-            var x: CGFloat = 6
+            let available = max(1, bounds.width - 8)
+            var x: CGFloat = 6, widest: CGFloat = 6
+            var line = 0
             for (index, row) in rows.enumerated() {
                 row.isHidden = index >= titles.count
                 guard index < titles.count else { continue }
-                let width = min(260, ceil(titles[index].size().width) + 16)
-                row.frame = NSRect(x: x, y: 5, width: width, height: 30)
+                let width = min(260, max(1, available - 64), ceil(titles[index].size().width) + 16)
+                if x > 6 && x + width + 54 > available { x = 6; line += 1 }
+                row.frame = NSRect(x: x, y: CGFloat(line) * 36, width: width, height: 30)
                 x += width + 2
+                widest = max(widest, x)
             }
+            let height = CGFloat(line) * 36 + 40
+            for row in rows where !row.isHidden { row.frame.origin.y = height - 35 - row.frame.minY }
             if candidates.isEmpty {
-                footer.frame = NSRect(x: 14, y: 12, width: 200, height: 15)
-                x = 220
+                x = min(220, max(1, available - 52))
+                widest = x
+                footer.frame = NSRect(x: 14, y: 12, width: max(1, x - 20), height: 15)
             }
             previous.frame = NSRect(x: x + 2, y: 7, width: 22, height: 25)
             next.frame = NSRect(x: x + 24, y: 7, width: 22, height: 25)
-            size = NSSize(width: x + 52, height: 40)
+            size = NSSize(width: widest + 52, height: height)
         } else {
             heading.isHidden = false
             footer.isHidden = false
             let textWidth = titles.map { ceil($0.size().width) }.max() ?? 220
-            let width = min(620, max(290, textWidth + 30))
+            let width = min(620, max(1, bounds.width - 8), max(290, textWidth + 30))
             let height = CGFloat(max(1, candidates.count)) * 31 + 68
             heading.frame = NSRect(x: 14, y: height - 29, width: width - 28, height: 18)
             heading.stringValue = pinyin
@@ -169,11 +177,16 @@ final class CandidatePanel {
         return label
     }
 
+    private func screenBounds(_ caret: NSRect) -> NSRect {
+        let point = caret == .zero ? NSEvent.mouseLocation : caret.origin
+        let screen = NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main
+        return screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
     private func place(_ size: NSSize, caret: NSRect, windowLevel: Int) {
         surface.frame = NSRect(origin: .zero, size: size)
         let point = caret == .zero ? NSEvent.mouseLocation : caret.origin
-        let screen = NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main
-        let bounds = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let bounds = screenBounds(caret)
         var origin = NSPoint(x: point.x, y: point.y - size.height - 6)
         if origin.y < bounds.minY { origin.y = caret.maxY + 6 }
         origin.x = max(bounds.minX + 4, min(origin.x, bounds.maxX - size.width - 4))

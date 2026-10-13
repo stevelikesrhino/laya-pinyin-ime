@@ -10,13 +10,13 @@ import sys
 import threading
 from pathlib import Path
 
-from dictionary import INITIAL_COST, Dictionary, Personal, normalize
+from dictionary import INITIAL_COST, Dictionary, Personal, normalize, personalize
 
-# Candidates the model re-ranks, by list. Wider windows put more of the right words on page 1 once the model is
-# trained on that many options; the rest keep dictionary order. abbreviated() returns at most 45, so all of it is
-# ranked. Completions were not evaluated beyond 9.
+# Candidates the model re-ranks, by list; the rest keep dictionary order. A lone zh/ch/sh combines 45 one-syllable
+# words with 45 two-syllable abbreviations: rank both pools so frequent characters cannot exclude words like 适合.
+# Other abbreviation lists still have at most 45 options. Completions were not evaluated beyond 9.
 EXACT_WINDOW = 32
-ABBREVIATED_WINDOW = 45
+ABBREVIATED_WINDOW = 90
 COMPLETION_WINDOW = 9
 # Phrases composed for mixed input that the model ranks as whole options in one call, and how many may go before the
 # best whole-key word (and after it, when that word is abbreviated or completed).
@@ -191,13 +191,23 @@ class Engine:
                 result.append({"text": text, "consumed": offsets[length - 1]})
                 seen.add(text)
 
-        if use_learning and not breaks:
-            for text, _ in self.personal.lookup(key):
-                add(text, len(key))
-        learned = len(result)
+        learned = self.personal.lookup(key) if use_learning and not breaks else []
         exact = [word for word in self.dictionary.exact(key) if word.accepts(breaks)]
         abbreviated = list(self.dictionary.abbreviated(key)) if not breaks else []
+        completed = [word for word in self.dictionary.complete(key) if word.accepts(breaks)]
         initial = len(key) == 1 and key not in "aoe"
+        if exact and not initial:
+            exact = personalize(exact, learned)
+        elif abbreviated:
+            abbreviated = personalize(abbreviated, learned)
+        elif completed or not learned:
+            completed = personalize(completed, learned)
+        else:
+            # Mixed input (zhwei) has no whole-key list; its learned words compete with the words it spells, which the
+            # client lists as mixed words and the phrase stage proposes here.
+            spelled = [word.freq for tokens in self.dictionary.tokenizations(key, breaks) if self.dictionary.mixed(tokens)
+                       for word, _ in self.dictionary.words(tokens, True)]
+            completed = personalize(completed, learned, max(spelled, default=1))
         if use_model:
             exact = self._rank(context, exact, EXACT_WINDOW)
             if not exact or initial:
@@ -212,11 +222,12 @@ class Engine:
         # Prefer real dictionary completions over dubious concatenations of rare characters.
         for word in abbreviated:
             add(word.text, len(key))
-        completed = [word for word in self.dictionary.complete(key) if word.accepts(breaks)]
         if use_model and not exact and not abbreviated:
             completed = self._rank(context, completed, COMPLETION_WINDOW)
         for word in completed:
             add(word.text, len(key))
+        for text, _ in learned:
+            add(text, len(key))
         whole = len(result)
 
         sentences = self.dictionary.sentences(key, breaks)
@@ -237,7 +248,7 @@ class Engine:
             add("".join(item[2].text for item in path), len(key))
         top, follow = None, 0
         word = next((word for word in exact + abbreviated + completed
-                     if whole > learned and word.text == result[learned]["text"]), None)
+                     if whole and word.text == result[0]["text"]), None)
         if word is not None:
             # Priced as the lattice prices a word: each syllable typed as an initial costs INITIAL_COST. The dictionary
             # abbreviates every syllable by its first letter (社会主义 is shzy); a completion abbreviates its last.
@@ -257,22 +268,17 @@ class Engine:
             if end < len(key):
                 prefix_groups.setdefault(end, []).append(word)
         for end, words in prefix_groups.items():
-            if use_learning and not breaks:
-                for text, _ in self.personal.lookup(key[:end]):
-                    add(text, end)
-            for word in words:
+            personal = self.personal.lookup(key[:end]) if use_learning and not breaks else []
+            for word in personalize(words, personal):
                 add(word.text, end)
         # Phrases ranked above the best whole-key word go before it (shm: 什么 before 三河马), at most a few so that
         # the dictionary's list stays on page 1, and a few follow an abbreviated or completed word. Full pinyin keeps
-        # its own words next: 实力 after 视力, not a completion of shili. A listed phrase moves up; learned words stay
-        # first.
-        learned_texts = {candidate["text"] for candidate in result[:learned]}
-        phrases = [text for text in phrases if text not in learned_texts]
+        # its own words next: 实力 after 视力, not a completion of shili. Personal words compete here too.
         if top is not None and phrases:
             at = phrases.index(top[0])
             rest = phrases[PHRASE_SHOWN:at] + phrases[at + 1:]
             phrases = phrases[:min(at, PHRASE_SHOWN)] + [top[0]] + rest[:follow]
-        position = learned
+        position = 0
         for text in phrases:
             index = next((i for i, candidate in enumerate(result) if candidate["text"] == text), len(result))
             if index >= position:
@@ -280,6 +286,12 @@ class Engine:
                 result.insert(position, {"text": text, "consumed": offsets[len(key) - 1]})
                 position += 1
         del result[limit:]
+        # Keep page one intact, but leave room on later pages for less-used personal spellings.
+        present = {candidate["text"] for candidate in result}
+        tail = [{"text": text, "consumed": offsets[len(key) - 1]} for text, _ in learned if text not in present]
+        tail = tail[:max(0, limit - 9)]
+        if tail:
+            result[max(9, limit - len(tail)):] = tail
         return result
 
     def handle(self, request):

@@ -279,10 +279,12 @@ final class LayaInputController: IMKInputController {
                 }
                 let reranked = Set(merged.map(\.text))
                 let local = self.candidates.map(\.text)
-                // Keep local-only candidates (e.g. fuzzy readings) near their local positions.
+                // Lone digraphs rank a wider pool than the local 45. Its leftovers lost that ranking; they must
+                // not displace the model's winner. Other local-only choices (e.g. fuzzy readings) stay near their slots.
+                let digraph = ["zh", "ch", "sh"].contains(input.trimmingCharacters(in: CharacterSet(charactersIn: "'")))
                 for (index, candidate) in self.candidates.enumerated()
                 where !merged.contains(where: { $0.text == candidate.text }) {
-                    merged.insert(candidate, at: min(index, merged.count))
+                    merged.insert(candidate, at: ranked && digraph ? merged.count : min(index, merged.count))
                 }
                 // Mark what the model placed ahead of its dictionary position, or composed itself.
                 self.promoted = ranked && !local.isEmpty ? Set(merged.indices.filter {
@@ -399,15 +401,11 @@ final class LayaInputController: IMKInputController {
         if candidates.indices.contains(selected) {
             let candidate = candidates[selected]
             let literal = String(pinyin.dropFirst(candidate.consumed)).trimmingCharacters(in: CharacterSet(charactersIn: "'"))
-            let consumed = String(pinyin.prefix(candidate.consumed))
             let output = displayText(candidate.text) + literal
             reset()
             insert(output)
-            if UserDefaults.standard.bool(forKey: "personalLearning") {
-                BackendClient.shared.learn(pinyin: consumed, text: candidate.text)
-            }
-            parts.append((consumed, candidate.text))
-            if literal.isEmpty { learnParts() } else { parts = [] }
+            // Punctuation, shortcuts and focus changes accept the default implicitly; do not reinforce it.
+            parts = []
         } else { commitRaw() }
     }
 
